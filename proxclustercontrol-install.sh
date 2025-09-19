@@ -15,6 +15,15 @@
 
 set -e
 
+# Function to run commands that may fail without exiting
+run_safe() {
+    if ! "$@"; then
+        msg_warn "Command failed: $*"
+        return 1
+    fi
+    return 0
+}
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -82,30 +91,111 @@ msg_info "ProxClusterControl Installation Starting..."
 
 # Configuration
 APP="ProxClusterControl"
-DISK_SIZE="8"
-CORE_COUNT="2"
-RAM_SIZE="2048"
 OSTYPE="debian"
 OSVERSION="12"
 
-# Get next available CT ID
+# Get next available CT ID for default suggestion
 NEXTID=$(pvesh get /cluster/nextid)
-CT_ID=${NEXTID}
+
+echo ""
+echo -e "${BLUE}📋 Container Configuration${NC}"
+echo "Configure your ProxClusterControl container settings:"
+echo ""
+
+# Container ID
+read -p "Container ID (default: $NEXTID): " input_ct_id
+CT_ID=${input_ct_id:-$NEXTID}
+
+# Validate CT ID
+if pct status $CT_ID &>/dev/null; then
+    msg_error "Container ID $CT_ID already exists. Please choose a different ID."
+fi
+
+# Disk Size
+read -p "Disk Size in GB (default: 8): " input_disk
+DISK_SIZE=${input_disk:-8}
+
+# CPU Cores
+read -p "CPU Cores (default: 2): " input_cores
+CORE_COUNT=${input_cores:-2}
+
+# RAM Size
+read -p "RAM Size in MB (default: 2048): " input_ram
+RAM_SIZE=${input_ram:-2048}
+
+# Validate inputs
+if ! [[ "$DISK_SIZE" =~ ^[0-9]+$ ]] || [ "$DISK_SIZE" -lt 4 ]; then
+    msg_error "Disk size must be a number and at least 4GB"
+fi
+
+if ! [[ "$CORE_COUNT" =~ ^[0-9]+$ ]] || [ "$CORE_COUNT" -lt 1 ]; then
+    msg_error "CPU cores must be a number and at least 1"
+fi
+
+if ! [[ "$RAM_SIZE" =~ ^[0-9]+$ ]] || [ "$RAM_SIZE" -lt 1024 ]; then
+    msg_error "RAM size must be a number and at least 1024MB"
+fi
+
+echo ""
+echo -e "${YELLOW}⚙️  Summary of Configuration:${NC}"
+echo "   Container ID: $CT_ID"
+echo "   Disk Size: ${DISK_SIZE}GB"
+echo "   CPU Cores: $CORE_COUNT"
+echo "   RAM: ${RAM_SIZE}MB"
+echo ""
+
+read -p "Continue with installation? (y/N): " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled."
+    exit 0
+fi
+
+echo ""
+msg_info "Starting installation with Container ID: $CT_ID"
 
 # Detect storage for containers and templates separately
 NODE=$(hostname)
 
 # Find storage that supports container root filesystems (prefer rootdir, fallback to images)
-# First try to find storage with rootdir content
-ROOTFS_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json | jq -r '.[] | select(.enabled==1 and (.content | contains("rootdir"))) | .storage' | head -1)
+msg_info "Detecting available storage..."
 
-# If no rootdir storage found, try images content
+# Try to find storage with rootdir content (preferred)
+set +e  # Temporarily disable exit on error
+ROOTFS_STORAGE=""
+if command -v pvesh &> /dev/null && command -v jq &> /dev/null; then
+    ROOTFS_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json 2>/dev/null | jq -r '.[] | select(.enabled==1 and (.content | contains("rootdir"))) | .storage' 2>/dev/null | head -1)
+    
+    # If no rootdir storage found, try images content
+    if [[ -z "$ROOTFS_STORAGE" ]]; then
+        ROOTFS_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json 2>/dev/null | jq -r '.[] | select(.enabled==1 and (.content | contains("images"))) | .storage' 2>/dev/null | head -1)
+    fi
+fi
+set -e  # Re-enable exit on error
+
+# Fallback to common storage names if detection failed
 if [[ -z "$ROOTFS_STORAGE" ]]; then
-    ROOTFS_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json | jq -r '.[] | select(.enabled==1 and (.content | contains("images"))) | .storage' | head -1)
+    msg_warn "Automatic storage detection failed, trying common storage names..."
+    for storage in "local-lvm" "local-zfs" "local-btrfs" "data" "storage"; do
+        if pvesm list "$storage" >/dev/null 2>&1; then
+            ROOTFS_STORAGE="$storage"
+            msg_info "Found storage: $storage"
+            break
+        fi
+    done
 fi
 
 # Find storage for templates
-TEMPLATE_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json | jq -r '.[] | select(.enabled==1 and (.content|contains("vztmpl"))) | .storage' | head -1)
+TEMPLATE_STORAGE=""
+set +e
+if command -v pvesh &> /dev/null && command -v jq &> /dev/null; then
+    TEMPLATE_STORAGE=$(pvesh get /nodes/$NODE/storage --output-format json 2>/dev/null | jq -r '.[] | select(.enabled==1 and (.content|contains("vztmpl"))) | .storage' 2>/dev/null | head -1)
+fi
+set -e
+
+# Default to local for templates if not found
+if [[ -z "$TEMPLATE_STORAGE" ]]; then
+    TEMPLATE_STORAGE="local"
+fi
 
 # Validate storages
 if [[ -z "$ROOTFS_STORAGE" ]]; then
@@ -118,7 +208,7 @@ Please enable container storage:
 4. Ensure it's enabled on this node
 
 Available storages:
-$(pvesh get /nodes/$NODE/storage --output-format json | jq -r '.[] | "  " + .storage + ": " + (.content // "no content") + " (enabled: " + (.enabled // false | tostring) + ")"')"
+$(set +e; pvesh get /nodes/$NODE/storage --output-format json 2>/dev/null | jq -r '.[] | "  " + .storage + ": " + (.content // "no content") + " (enabled: " + (.enabled // false | tostring) + ")"' 2>/dev/null || echo "  Unable to list storages automatically"; set -e)"
 fi
 
 if [[ -z "$TEMPLATE_STORAGE" ]]; then
@@ -128,17 +218,24 @@ fi
 
 # Check available space for container
 NEED_BYTES=$(( DISK_SIZE * 1024 * 1024 * 1024 ))
-AVAIL=$(pvesh get /nodes/$NODE/storage --output-format json | jq -r --arg s "$ROOTFS_STORAGE" '.[] | select(.storage==$s) | .avail // 0')
+set +e
+AVAIL=$(pvesh get /nodes/$NODE/storage --output-format json 2>/dev/null | jq -r --arg s "$ROOTFS_STORAGE" '.[] | select(.storage==$s) | .avail // 0' 2>/dev/null)
+set -e
 
-if [[ -n "$AVAIL" ]] && [[ "$AVAIL" -gt 0 ]] && [[ "$AVAIL" -lt "$NEED_BYTES" ]]; then
+if [[ -n "$AVAIL" ]] && [[ "$AVAIL" =~ ^[0-9]+$ ]] && [[ "$AVAIL" -gt 0 ]] && [[ "$AVAIL" -lt "$NEED_BYTES" ]]; then
     AVAIL_GB=$(( AVAIL / 1024 / 1024 / 1024 ))
     msg_error "Insufficient space on storage '$ROOTFS_STORAGE': ${AVAIL_GB}GB available, ${DISK_SIZE}GB needed"
+elif [[ -z "$AVAIL" ]] || [[ ! "$AVAIL" =~ ^[0-9]+$ ]]; then
+    msg_warn "Could not determine available space on '$ROOTFS_STORAGE' - continuing anyway"
 fi
 
 # Get bridge interface
-BRIDGE=$(pvesh get /nodes/$(hostname)/network --output-format json | jq -r '.[] | select(.type == "bridge") | .iface' | head -1)
+set +e
+BRIDGE=$(pvesh get /nodes/$(hostname)/network --output-format json 2>/dev/null | jq -r '.[] | select(.type == "bridge") | .iface' 2>/dev/null | head -1)
+set -e
 if [[ -z "$BRIDGE" ]]; then
     BRIDGE="vmbr0"
+    msg_warn "Could not detect bridge interface, using default: vmbr0"
 fi
 
 msg_info "Configuration:"
@@ -213,39 +310,94 @@ if [[ -z "$CT_IP" ]]; then
     CT_IP="[Container-$CT_ID]"
 fi
 
+# Show credentials immediately (so user gets them even if installation fails later)
+show_credentials() {
+    echo ""
+    echo -e "${GREEN}🔑 ProxClusterControl Access Information${NC}"
+    echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                    ACCESS INFORMATION                        ║${NC}"  
+    echo -e "${RED}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${RED}║${NC} ${BLUE}Web Interface:${NC} ${YELLOW}http://$CT_IP:5000${NC}                     ${RED}║${NC}"
+    echo -e "${RED}║${NC} ${BLUE}Username:${NC}      ${YELLOW}admin${NC}                                ${RED}║${NC}"
+    echo -e "${RED}║${NC} ${BLUE}Password:${NC}      ${YELLOW}$PANEL_PASSWORD${NC}                ${RED}║${NC}"
+    echo -e "${RED}║${NC} ${BLUE}Container ID:${NC}  ${YELLOW}$CT_ID${NC}                                ${RED}║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# Set trap to always show credentials on exit
+trap 'show_credentials' EXIT
+
+# Show credentials now (in case installation fails later)
+msg_ok "Container created successfully!"
+show_credentials
+
 # Install ProxClusterControl inside container
 msg_info "Installing ProxClusterControl application..."
-pct exec $CT_ID -- bash -c 'export DEBIAN_FRONTEND=noninteractive
 
-# Update system
-apt-get update && apt-get upgrade -y
+# Step 1: Update system
+msg_info "Updating system packages..."
+if ! pct exec $CT_ID -- bash -c 'export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get upgrade -y'; then
+    msg_error "Failed to update system packages"
+    exit 1
+fi
 
-# Install required packages
-apt-get install -y curl wget gnupg2 software-properties-common git build-essential ufw
+# Step 2: Install required packages  
+msg_info "Installing required packages..."
+if ! pct exec $CT_ID -- bash -c 'export DEBIAN_FRONTEND=noninteractive && apt-get install -y curl wget gnupg2 software-properties-common git build-essential ufw'; then
+    msg_error "Failed to install required packages"
+    exit 1
+fi
 
-# Install Node.js 20.x
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
+# Step 3: Install Node.js
+msg_info "Installing Node.js 20.x..."
+if ! pct exec $CT_ID -- bash -c 'curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs'; then
+    msg_error "Failed to install Node.js"
+    exit 1
+fi
 
-# Install PostgreSQL
-apt-get install -y postgresql postgresql-contrib
+# Step 4: Install PostgreSQL
+msg_info "Installing PostgreSQL..."
+if ! pct exec $CT_ID -- bash -c 'export DEBIAN_FRONTEND=noninteractive && apt-get install -y postgresql postgresql-contrib'; then
+    msg_error "Failed to install PostgreSQL"
+    exit 1
+fi
 
-# Start and enable PostgreSQL
-systemctl start postgresql
-systemctl enable postgresql
+# Step 5: Configure PostgreSQL
+msg_info "Configuring PostgreSQL..."
+if ! pct exec $CT_ID -- bash -c 'set -euo pipefail; 
+systemctl start postgresql && systemctl enable postgresql
 
-# Configure PostgreSQL
-sudo -u postgres psql -c "CREATE DATABASE proxclustercontrol;" || true
-sudo -u postgres psql -c "CREATE USER proxclustercontrol WITH ENCRYPTED PASSWORD '\''proxcluster123'\'';" || true
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE proxclustercontrol TO proxclustercontrol;" || true
-sudo -u postgres psql -c "ALTER USER proxclustercontrol CREATEDB;" || true
+# Create database if it does not exist
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='\''proxclustercontrol'\''" | grep -q 1; then
+    sudo -u postgres createdb proxclustercontrol
+fi
 
+# Create user if it does not exist  
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='\''proxclustercontrol'\''" | grep -q 1; then
+    sudo -u postgres psql -c "CREATE USER proxclustercontrol WITH ENCRYPTED PASSWORD '\''proxcluster123'\'';"
+fi
+
+# Grant privileges
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE proxclustercontrol TO proxclustercontrol;"
+sudo -u postgres psql -c "ALTER USER proxclustercontrol CREATEDB;"
+'; then
+    msg_error "Failed to configure PostgreSQL"
+    exit 1
+fi
+
+# Generate session secret for application
+SESSION_SECRET=$(openssl rand -hex 32)
+
+# Step 6: Setup application files  
+msg_info "Creating application directory and configuration..."
+if ! pct exec $CT_ID -- bash -c 'set -e;
 # Create application directory
 mkdir -p /opt/proxclustercontrol
 cd /opt/proxclustercontrol
 
 # Create package.json
-cat > package.json << '\''EOFPACKAGE'\''
+cat > package.json << "EOFPACKAGE"
 {
   "name": "proxclustercontrol",
   "version": "1.0.0",
@@ -266,35 +418,50 @@ EOFPACKAGE
 
 # Install basic dependencies
 npm install --production
+'; then
+    msg_error "Failed to setup application files"
+    exit 1
+fi
 
-# Set up environment variables
-SESSION_SECRET=$(openssl rand -hex 32)
-cat > .env << '\''EOFENV'\''
+# Step 7: Configure environment  
+msg_info "Setting up environment variables..."
+if ! pct exec $CT_ID -- env SESSION_SECRET="$SESSION_SECRET" PANEL_PASSWORD="$PANEL_PASSWORD" bash -c 'set -e;
+cd /opt/proxclustercontrol
+# Set up environment variables  
+cat > .env << EOFENV
 NODE_ENV=production
 PORT=5000
 DATABASE_URL=postgresql://proxclustercontrol:proxcluster123@localhost:5432/proxclustercontrol
-SESSION_SECRET='$SESSION_SECRET'
+SESSION_SECRET=$SESSION_SECRET
 PGUSER=proxclustercontrol
 PGPASSWORD=proxcluster123
 PGHOST=localhost
 PGPORT=5432
 PGDATABASE=proxclustercontrol
 PANEL_USERNAME=admin
-PANEL_PASSWORD='$PANEL_PASSWORD'
+PANEL_PASSWORD=$PANEL_PASSWORD
 EOFENV
+'; then
+    msg_error "Failed to configure environment variables"
+    exit 1
+fi
 
+# Step 8: Create application server
+msg_info "Creating application server files..."
+if ! pct exec $CT_ID -- bash -c 'set -e;
+cd /opt/proxclustercontrol
 # Create basic server with authentication
 mkdir -p server client/dist
-cat > server/index.js << '\''EOFSERVER'\''
-const express = require('\''express'\'');
-const path = require('\''path'\'');
-const session = require('\''express-session'\'');
+cat > server/index.js << "EOFSERVER"
+const express = require("express");
+const path = require("path");
+const session = require("express-session");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Session middleware
 app.use(session({
-  secret: process.env.SESSION_SECRET || '\''fallback-secret'\'',
+  secret: process.env.SESSION_SECRET || "fallback-secret",
   resave: false,
   saveUninitialized: false,
   cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 } // 24 hours
@@ -308,56 +475,63 @@ const requireAuth = (req, res, next) => {
   if (req.session.authenticated) {
     next();
   } else {
-    res.redirect('\''/login'\'');
+    res.redirect("/login");
   }
 };
 
 // Login route
-app.get('\''/login'\'', (req, res) => {
-  res.sendFile(path.join(__dirname, '\''../client/dist/login.html'\''));
+app.get("/login", (req, res) => {
+  res.sendFile(path.join(__dirname, "../client/dist/login.html"));
 });
 
-app.post('\''/api/login'\'', (req, res) => {
+app.post("/api/login", (req, res) => {
   const { username, password } = req.body;
   if (username === process.env.PANEL_USERNAME && password === process.env.PANEL_PASSWORD) {
     req.session.authenticated = true;
     res.json({ success: true });
   } else {
-    res.status(401).json({ success: false, message: '\''Invalid credentials'\'' });
+    res.status(401).json({ success: false, message: "Invalid credentials" });
   }
 });
 
-app.get('\''/api/logout'\'', (req, res) => {
+app.get("/api/logout", (req, res) => {
   req.session.destroy(() => {
-    res.redirect('\''/login'\'');
+    res.redirect("/login");
   });
 });
 
-app.get('\''/api/health'\'', (req, res) => {
+app.get("/api/health", (req, res) => {
   res.json({ 
-    status: '\''ok'\'', 
-    message: '\''ProxClusterControl is running'\'',
-    version: '\''1.0.0'\'',
+    status: "ok", 
+    message: "ProxClusterControl is running",
+    version: "1.0.0",
     timestamp: new Date().toISOString(),
     authenticated: !!req.session.authenticated
   });
 });
 
 // Protected static files
-app.use('\''/'\'', requireAuth, express.static(path.join(__dirname, '\''../client/dist'\'')));
+app.use("/", requireAuth, express.static(path.join(__dirname, "../client/dist")));
 
-app.get('\''*'\'', requireAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, '\''../client/dist/index.html'\''));
+app.get("*", requireAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, "../client/dist/index.html"));
 });
 
-app.listen(PORT, '\''0.0.0.0'\'', () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`ProxClusterControl server running on port ${PORT}`);
-  console.log(`Default credentials: admin / ${process.env.PANEL_PASSWORD}`);
 });
 EOFSERVER
+'; then
+    msg_error "Failed to create application server"
+    exit 1
+fi
 
+# Step 9: Create web interface files
+msg_info "Creating web interface..."
+if ! pct exec $CT_ID -- bash -c 'set -e;
+cd /opt/proxclustercontrol
 # Create login page
-cat > client/dist/login.html << '\''EOFLOGIN'\''
+cat > client/dist/login.html << "EOFLOGIN"
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -449,8 +623,8 @@ cat > client/dist/login.html << '\''EOFLOGIN'\''
 </html>
 EOFLOGIN
 
-# Create web interface
-cat > client/dist/index.html << '\''EOFHTML'\''
+# Create main page
+cat > client/dist/index.html << "EOFHTML"
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -573,9 +747,16 @@ cat > client/dist/index.html << '\''EOFHTML'\''
 </body>
 </html>
 EOFHTML
+'; then
+    msg_error "Failed to create web interface files"
+    exit 1
+fi
 
+# Step 10: Create and start service
+msg_info "Creating and starting ProxClusterControl service..."
+if ! pct exec $CT_ID -- bash -c 'set -e;
 # Create systemd service
-cat > /etc/systemd/system/proxclustercontrol.service << '\''EOFSERVICE'\''
+cat > /etc/systemd/system/proxclustercontrol.service << "EOFSERVICE"
 [Unit]
 Description=ProxClusterControl - Modern Proxmox VE Control Panel
 After=network.target postgresql.service
@@ -606,7 +787,12 @@ systemctl start proxclustercontrol
 ufw allow 5000/tcp
 
 echo "ProxClusterControl installation completed successfully!"
-'
+'; then
+    msg_error "Failed to create and start service"
+    exit 1
+fi
+
+msg_ok "Installation completed successfully inside container!"
 
 # Check if installation was successful
 if pct exec $CT_ID -- systemctl is-active --quiet proxclustercontrol; then
@@ -616,7 +802,7 @@ else
 fi
 
 # Save credentials to file for reference
-pct exec $CT_ID -- bash -c "cat > /root/proxclustercontrol-credentials.txt << 'EOFCREDS'
+pct exec $CT_ID -- bash -c "cat > /root/proxclustercontrol-credentials.txt << EOFCREDS
 ProxClusterControl Installation Credentials
 =================================
 
